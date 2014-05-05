@@ -1,0 +1,146 @@
+#!/usr/local/bin/python
+
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)-15s %(message)s")
+import pprint
+
+import glob
+import bisect
+from bisect import bisect_right
+import re
+import string
+import datetime
+from cStringIO import StringIO
+
+import subprocess
+import sys
+import os
+from os import path
+import shutil
+
+import markdown, feedformatter
+
+def format_afd_content(content):
+    content = re.sub("(?<!\n)\n(?!\n)", " ", content)
+    return "\n".join( string.capwords(line, ". ") for line in content.splitlines() ) + "\n"
+
+def parse_afd_time(time_string):
+    time_string = time_string.split()
+    time_string[0] = "%04i" % int(time_string[0])
+    return datetime.datetime.strptime(
+        " ".join(time_string), 
+        "%I%M %p %Z %a %B %d %Y")
+
+def pformat_time(timestamp):
+    return timestamp.strftime("%I:%M %p %A %B %d")
+
+def parse_afd( afd ):
+    # Find all headers in afd and all potential section endpoints
+    headers = { h.group(1) : h.span() for h in re.finditer("^\.([^.]*)\.\.\.", afd, re.MULTILINE)}
+    endpoints = sorted( set( [ endmark.start() for endmark in  re.finditer("\n&&\n", afd, re.MULTILINE) ] + [s for s, e in headers.values()] ))
+    
+    # Find closest endpoint for each header's content section and get content
+    header_result_spans = { h : (content_start, endpoints[ bisect_right( endpoints, content_start)]) for h, (header_start, content_start) in headers.items() }
+    
+    afd_data = { h : afd[start:end].strip() for h, (start, end) in header_result_spans.items() }
+    
+    afd_data["TIME"] = re.search("AREA FORECAST DISCUSSION\nNATIONAL WEATHER SERVICE SEATTLE WA\n(.*)\n", afd).group(1)
+
+    return {
+            "timestamp" : parse_afd_time( afd_data["TIME"] ),
+            "content" : afd_data }
+
+def format_afd(afd):
+    afd_sections = afd["content"]
+    
+    meta_sections = ["TIME", "SYNOPSIS"]
+    main_section_names = ["SHORT TERM", "LONG TERM"]
+    main_sections = []
+    for n in main_section_names:
+        main_sections.extend( glob.fnmatch.filter( afd_sections.keys(), n + "*") )
+        
+    formatted_AFD = StringIO()
+
+    formatted_AFD.write( pformat_time(afd["timestamp"]) + "\n")
+    formatted_AFD.write("=" * len( afd_sections["TIME"]) + "\n" )
+    formatted_AFD.write( format_afd_content(afd_sections["SYNOPSIS"]) + "\n")
+    
+    for h in main_sections:
+        formatted_AFD.write( h + "\n" )
+        formatted_AFD.write( "-" * len(h) + "\n" )
+        formatted_AFD.write( format_afd_content(afd_sections[h]))
+        formatted_AFD.write("\n")
+    
+    for h in set( afd_sections.keys() ).difference( set( main_sections + meta_sections )):
+        formatted_AFD.write( h + "\n" )
+        formatted_AFD.write( "-" * len(h) + "\n" )
+        formatted_AFD.write( format_afd_content(afd_sections[h]))
+        formatted_AFD.write("\n")
+
+    return formatted_AFD.getvalue()
+
+def setup_afd_feed(result_dir, afd_entries):
+    if path.exists(result_dir):
+        logging.info("Removing existing root: %s", result_dir)
+        shutil.rmtree(result_dir)
+    os.makedirs(result_dir)
+
+    afd_feed_items = []
+
+    for afd_entry in sorted(afd_entries, reverse = True, key=lambda e: e["timestamp"] ):
+        eid = afd_entry["timestamp"].strftime("%y-%m-%d-%H%m")
+
+        entry_md = format_afd(afd_entry)
+        logging.debug("Rendered entry md:\n%s", entry_md)
+        entry_md_file = path.join(result_dir, eid + ".md")
+        logging.info("Writing entry file: %s", entry_md_file)
+        with open(entry_md_file, "w") as md_out:
+            md_out.write(entry_md)
+
+        item = {}
+
+        item["title"] = pformat_time(afd_entry["timestamp"])
+        item["link"] = eid + ".md"
+        item["description"] = markdown.markdown( entry_md )
+        item["markdown"] = entry_md
+        item["pubDate"] = afd_entry["timestamp"].timetuple()
+        item["guid"] = eid
+        afd_feed_items.append(item)
+
+    logging.info("Writing current: %s", afd_feed_items[0]["guid"])
+    with open( path.join(result_dir, "current.md"), "w") as md_out:
+        md_out.write( afd_feed_items[0]["markdown"] )
+
+    afd_feed = feedformatter.Feed()
+
+    afd_feed.feed["title"] = "NWS Seattle Area Forecast Discussion"
+    afd_feed.feed["link"] = "current.md"
+    afd_feed.feed["author"] = "a.sewall.ford@gmail.com"
+    afd_feed.feed["description"] = "NWS Seattle Area Forecast Discussion"
+    afd_feed.entries.extend(afd_feed_items)
+
+    logging.info("Rendering feed file: %s", path.join(result_dir, "AFDSEW.xml"))
+
+    afd_feed.format_atom_file( path.join(result_dir, "AFDSEW.xml"))
+
+    return result_dir
+
+if __name__ == '__main__':
+    logging.info("Syncing")
+    script_root_dir = path.dirname( path.abspath(__file__) )
+    lftp_executable = "/usr/local/bin/lftp"
+
+    lftp = subprocess.Popen(lftp_executable, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd = script_root_dir)
+
+    lftp.communicate(
+            "open http://www.nws.noaa.gov/data/SEW/" "\n"
+            "mirror -I AFDSEW.* -c . raw_SEW" "\n"
+            "exit" "\n")
+
+    feed_files = glob.glob(path.join(script_root_dir, "raw_SEW/AFDSEW.*"))
+    logging.info("feed_files:\n%s", pprint.pformat(feed_files))
+    
+    afd_entries = [parse_afd( open( s ).read() ) for s in feed_files]
+    logging.info("Parsed %s entries.", len(afd_entries))
+
+    setup_afd_feed( path.join(script_root_dir, "SEW"), afd_entries)
